@@ -29,7 +29,12 @@ REGIONS_BY_PROVIDER = {
         "cn-east-3",
         "cn-south-1",
     ),
-    "阿里云OSS": ("cn-hangzhou", "cn-shanghai", "cn-beijing"),
+    "阿里云OSS": (
+        "cn-hangzhou",
+        "cn-shanghai",
+        "cn-beijing",
+        "cn-wuhan-lr",
+    ),
     "腾讯云COS": ("ap-guangzhou", "ap-shanghai", "ap-beijing"),
     "AWS S3": ("us-east-1", "us-west-2", "eu-west-1"),
     "自定义S3": (),
@@ -78,6 +83,90 @@ def default_endpoint_for(provider: str, region: str) -> str:
 def profiles_for_provider(profiles, provider):
     """Return saved logins for one provider without changing their order."""
     return [profile for profile in profiles if profile.get("provider") == provider]
+
+
+def find_profile_for_bucket(profiles, source_profile, bucket_name):
+    """Find a saved profile for the same provider/account and bucket."""
+    provider = str(source_profile.get("provider", "")).strip()
+    access_key_id = str(source_profile.get("access_key_id", "")).strip()
+    bucket_name = str(bucket_name).strip()
+    for profile in profiles:
+        if (
+            str(profile.get("provider", "")).strip() == provider
+            and str(profile.get("access_key_id", "")).strip() == access_key_id
+            and str(profile.get("bucket_name", "")).strip() == bucket_name
+        ):
+            return profile
+    return None
+
+
+def endpoint_url_from_error_response(response):
+    """Extract a safe HTTPS endpoint from an S3-compatible error response."""
+    if not isinstance(response, dict):
+        return None
+    error = response.get("Error")
+    if not isinstance(error, dict):
+        return None
+    endpoint = str(error.get("Endpoint", "")).strip()
+    if not endpoint:
+        return None
+    if "://" not in endpoint:
+        endpoint = f"https://{endpoint}"
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        return None
+    return f"https://{parsed.netloc}"
+
+
+def endpoint_matches_provider(provider, endpoint_url):
+    """Return whether an auto-discovered endpoint belongs to the provider."""
+    parsed = urlparse(str(endpoint_url).strip())
+    hostname = (parsed.hostname or "").lower()
+    suffixes = {
+        "阿里云OSS": ".aliyuncs.com",
+        "华为云OBS": ".myhuaweicloud.com",
+        "腾讯云COS": ".myqcloud.com",
+        "AWS S3": ".amazonaws.com",
+    }
+    suffix = suffixes.get(provider)
+    return bool(
+        suffix
+        and parsed.scheme == "https"
+        and hostname.endswith(suffix)
+        and hostname != suffix.lstrip(".")
+    )
+
+
+def region_from_endpoint(provider, endpoint_url):
+    """Infer a provider region from a standard public or internal endpoint."""
+    parsed = urlparse(str(endpoint_url).strip())
+    hostname = (parsed.hostname or "").lower()
+    labels = hostname.split(".")
+
+    if provider == "阿里云OSS":
+        for label in labels:
+            if label.startswith("oss-"):
+                region = label[len("oss-"):]
+                if region.endswith("-internal"):
+                    region = region[:-len("-internal")]
+                return region
+    if provider == "华为云OBS" and "obs" in labels:
+        index = labels.index("obs")
+        if index + 1 < len(labels):
+            return labels[index + 1]
+    if provider == "腾讯云COS" and "cos" in labels:
+        index = labels.index("cos")
+        if index + 1 < len(labels):
+            return labels[index + 1]
+    if provider == "AWS S3":
+        if hostname == "s3.amazonaws.com":
+            return "us-east-1"
+        for index, label in enumerate(labels):
+            if label == "s3" and index + 1 < len(labels):
+                return labels[index + 1]
+    return ""
 
 
 def validate_profile(profile: dict) -> dict:

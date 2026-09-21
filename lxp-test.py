@@ -30,7 +30,11 @@ from s3_profiles import (
     ProfileStore,
     ProfileStoreError,
     default_endpoint_for,
+    endpoint_matches_provider,
+    endpoint_url_from_error_response,
+    find_profile_for_bucket,
     profiles_for_provider,
+    region_from_endpoint,
     validate_profile,
 )
 
@@ -139,6 +143,35 @@ def create_s3_client(profile):
     if CA_BUNDLE_PATH:
         kwargs['verify'] = CA_BUNDLE_PATH
     return boto3.client(**kwargs)
+
+
+def create_verified_s3_client(profile):
+    """Create a client, following one trusted bucket endpoint redirect."""
+    profile = validate_profile(profile)
+    client = create_s3_client(profile)
+    request = {'Bucket': profile['bucket_name'], 'MaxKeys': 1}
+    try:
+        client.list_objects_v2(**request)
+        return client, profile
+    except ClientError as exc:
+        endpoint_url = endpoint_url_from_error_response(exc.response)
+        if (
+            not endpoint_url
+            or endpoint_url == profile['endpoint_url']
+            or not endpoint_matches_provider(profile['provider'], endpoint_url)
+        ):
+            raise
+
+        region = region_from_endpoint(profile['provider'], endpoint_url)
+        if not region:
+            raise
+        corrected_profile = dict(profile)
+        corrected_profile['endpoint_url'] = endpoint_url
+        corrected_profile['region_name'] = region
+        corrected_profile = validate_profile(corrected_profile)
+        corrected_client = create_s3_client(corrected_profile)
+        corrected_client.list_objects_v2(**request)
+        return corrected_client, corrected_profile
 
 
 class ProfileDialog:
@@ -279,9 +312,22 @@ class ProfileDialog:
         try:
             profile = self._collect_profile()
             if self.test_callback:
-                self.test_callback(profile)
-            messagebox.showinfo('连接成功', '凭据有效，Bucket 可以访问。',
-                                parent=self.window)
+                verified = self.test_callback(profile)
+                if verified:
+                    endpoint_changed = (
+                        verified['endpoint_url'] != profile['endpoint_url'])
+                    profile = verified
+                    self.region_var.set(profile['region_name'])
+                    self.endpoint_var.set(profile['endpoint_url'])
+                    if endpoint_changed:
+                        messagebox.showinfo(
+                            '连接成功',
+                            'Bucket 可以访问，且已自动修正 Region 和 Endpoint。',
+                            parent=self.window,
+                        )
+                        return
+            messagebox.showinfo(
+                '连接成功', '凭据有效，Bucket 可以访问。', parent=self.window)
         except Exception as exc:
             messagebox.showerror('连接失败', str(exc), parent=self.window)
 
@@ -531,7 +577,9 @@ class StartupLoginDialog:
             self.status_var.set('正在验证连接，请稍候...')
             self.window.update_idletasks()
             if self.test_callback:
-                self.test_callback(profile)
+                verified = self.test_callback(profile)
+                if verified:
+                    profile = verified
             self.result = profile
             self.window.destroy()
         except Exception as exc:
@@ -670,8 +718,8 @@ class S3BrowserTool:
     @staticmethod
     def test_profile_connection(profile):
         """Verify credentials using the configured bucket, not account-wide APIs."""
-        client = create_s3_client(profile)
-        client.list_objects_v2(Bucket=profile['bucket_name'], MaxKeys=1)
+        _client, verified_profile = create_verified_s3_client(profile)
+        return verified_profile
 
     def setup_aws_connection(self, show_error=True):
         """Connect using the selected profile and verify its configured bucket."""
@@ -681,8 +729,15 @@ class S3BrowserTool:
             self.status_var.set('尚未配置云存储')
             return False
         try:
-            client = create_s3_client(cfg)
-            client.list_objects_v2(Bucket=cfg['bucket_name'], MaxKeys=1)
+            client, verified_profile = create_verified_s3_client(cfg)
+            if verified_profile != cfg:
+                profile_index = self.profiles.index(cfg)
+                self.profiles[profile_index] = verified_profile
+                if not self._persist_profiles():
+                    self.profiles[profile_index] = cfg
+                    return False
+                cfg = verified_profile
+                self.reload_profile_controls()
             self.s3_client = client
             self.endpoint_url = cfg['endpoint_url']
             self.current_region = cfg['region_name']
@@ -1541,11 +1596,88 @@ class S3BrowserTool:
     # ═══════════════════════════════════════════════════════════
 
     def on_bucket_change(self, _event):
-        """处理桶下拉框变更，进入所选桶的根目录"""
-        self.current_bucket = self.bucket_var.get()
+        """Match or create a bucket-specific profile before showing objects."""
+        bucket = self.bucket_var.get().strip()
+        if not bucket:
+            return
+        current_profile = self.get_current_config()
+        if not current_profile:
+            messagebox.showwarning('提示', '请先新增或选择一个有效配置')
+            return
+
+        if bucket != current_profile['bucket_name']:
+            matched_profile = find_profile_for_bucket(
+                self.profiles, current_profile, bucket)
+            if matched_profile:
+                previous_selected = self.selected_profile_id
+                self.selected_profile_id = matched_profile['id']
+                if self._persist_profiles():
+                    self.reload_profile_controls()
+                    self.connect_current_profile()
+                else:
+                    self.selected_profile_id = previous_selected
+                    self.bucket_var.set(self.current_bucket)
+                return
+            if not self._create_bucket_profile(current_profile, bucket):
+                self.bucket_var.set(self.current_bucket)
+            return
+
+        self.current_bucket = bucket
         self.current_prefix = ''
         self.path_var.set(self.build_obs_path(prefix=''))
         self.list_objects_threaded(self.current_bucket, '')
+
+    def _unique_bucket_profile_name(self, provider, bucket):
+        base_name = f'{provider}-{bucket}'
+        used_names = {profile['name'].casefold() for profile in self.profiles}
+        if base_name.casefold() not in used_names:
+            return base_name
+        suffix = 2
+        while f'{base_name} ({suffix})'.casefold() in used_names:
+            suffix += 1
+        return f'{base_name} ({suffix})'
+
+    def _create_bucket_profile(self, source_profile, bucket):
+        """Discover a bucket endpoint and persist a dedicated local profile."""
+        candidate = dict(source_profile)
+        candidate.update({
+            'id': uuid.uuid4().hex,
+            'name': self._unique_bucket_profile_name(
+                source_profile['provider'], bucket),
+            'bucket_name': bucket,
+        })
+        try:
+            self.status_var.set(f'正在匹配 Bucket {bucket} 的 Endpoint...')
+            self.root.update_idletasks()
+            client, verified_profile = create_verified_s3_client(candidate)
+        except Exception as exc:
+            messagebox.showerror(
+                'Bucket 匹配失败',
+                f'无法为 Bucket“{bucket}”确定可用的 Endpoint：\n{exc}',
+            )
+            return False
+
+        previous_selected = self.selected_profile_id
+        self.profiles.append(verified_profile)
+        self.selected_profile_id = verified_profile['id']
+        if not self._persist_profiles():
+            self.profiles.pop()
+            self.selected_profile_id = previous_selected
+            return False
+
+        self.s3_client = client
+        self.endpoint_url = verified_profile['endpoint_url']
+        self.current_region = verified_profile['region_name']
+        self.current_bucket = bucket
+        self.current_prefix = ''
+        self.object_cache.clear()
+        self.metadata_cache.clear()
+        self.reload_profile_controls()
+        self.path_var.set(self.build_obs_path(prefix=''))
+        self.status_var.set(
+            f'已自动创建配置 {verified_profile["name"]}，正在加载...')
+        self.list_objects_threaded(bucket, '')
+        return True
 
     # ═══════════════════════════════════════════════════════════
     # ── 搜索 ──

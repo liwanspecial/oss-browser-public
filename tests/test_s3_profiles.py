@@ -13,7 +13,11 @@ from s3_profiles import (
     WindowsDpapiProtector,
     default_config_path,
     default_endpoint_for,
+    endpoint_url_from_error_response,
+    endpoint_matches_provider,
+    find_profile_for_bucket,
     profiles_for_provider,
+    region_from_endpoint,
     validate_profile,
 )
 
@@ -131,6 +135,79 @@ def test_profiles_for_provider_only_returns_matching_saved_logins():
     assert [
         profile["id"] for profile in profiles_for_provider(profiles, "阿里云OSS")
     ] == ["ali-one", "ali-two"]
+
+
+def test_aliyun_redirect_response_exposes_the_required_endpoint():
+    response = {
+        "Error": {
+            "Code": "PermanentRedirect",
+            "Endpoint": "oss-cn-wuhan-lr.aliyuncs.com",
+        }
+    }
+
+    assert endpoint_url_from_error_response(response) == (
+        "https://oss-cn-wuhan-lr.aliyuncs.com"
+    )
+
+
+def test_redirect_endpoint_must_belong_to_the_selected_provider():
+    assert endpoint_matches_provider(
+        "阿里云OSS", "https://oss-cn-wuhan-lr.aliyuncs.com"
+    )
+    assert not endpoint_matches_provider(
+        "阿里云OSS", "https://oss-cn-wuhan-lr.example.com"
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "endpoint", "expected"),
+    [
+        (
+            "阿里云OSS",
+            "https://oss-cn-wuhan-lr.aliyuncs.com",
+            "cn-wuhan-lr",
+        ),
+        (
+            "阿里云OSS",
+            "https://oss-cn-shanghai-internal.aliyuncs.com",
+            "cn-shanghai",
+        ),
+        (
+            "华为云OBS",
+            "https://obs.cn-north-4.myhuaweicloud.com",
+            "cn-north-4",
+        ),
+    ],
+)
+def test_region_from_endpoint(provider, endpoint, expected):
+    assert region_from_endpoint(provider, endpoint) == expected
+
+
+def test_find_profile_for_bucket_matches_provider_account_and_bucket():
+    source = make_profile(id="source", bucket_name="source-bucket")
+    expected = make_profile(
+        id="wuhan",
+        name="阿里云-武汉",
+        bucket_name="vdctesttest",
+        region_name="cn-wuhan-lr",
+        endpoint_url="https://oss-cn-wuhan-lr.aliyuncs.com",
+    )
+    profiles = [
+        expected,
+        make_profile(
+            id="other-account",
+            name="其他账号",
+            bucket_name="vdctesttest",
+            access_key_id="other-access-key",
+        ),
+    ]
+
+    assert find_profile_for_bucket(
+        profiles, source, "vdctesttest"
+    ) is expected
+    assert find_profile_for_bucket(
+        profiles, source, "missing-bucket"
+    ) is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI is Windows-only")
