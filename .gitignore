@@ -1,0 +1,31 @@
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local virtual environments and environment files
+.venv/
+venv/
+.env
+.env.*
+
+# PyInstaller build and release artifacts
+build/
+build-*/
+dist/
+dist-*/
+*.exe
+
+# Local application state and credentials
+.s3browser_config.ini
+profiles.json
+LxpS3Browser/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
