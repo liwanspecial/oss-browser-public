@@ -23,6 +23,9 @@ import platform
 import sys
 import shutil
 import uuid
+import queue
+
+from vdelog_browser import VdeLogRefreshDialog, is_vdelog_path, find_vin_folder
 
 from s3_profiles import (
     PROVIDERS,
@@ -667,6 +670,12 @@ class S3BrowserTool:
         self.use_local_time = True
         self.loading = False
         self.cancel_loading = False
+        self._listing_generation = 0
+        self._listing_cancel = None
+        self._listing_context = None
+        self._listing_vin = None
+        self._vdelog_choice = None
+        self._vdelog_dialog_open = False
         self.object_cache = defaultdict(dict)
         self.metadata_cache = defaultdict(lambda: defaultdict(dict))
         self.request_count = 0
@@ -754,7 +763,8 @@ class S3BrowserTool:
             return False
 
     def connect_current_profile(self):
-        self.cancel_loading = True
+        self._cancel_listing()
+        self._vdelog_choice = None
         self.object_cache.clear()
         self.metadata_cache.clear()
         self.current_prefix = ''
@@ -893,6 +903,8 @@ class S3BrowserTool:
             self.profiles = previous_profiles
             self.selected_profile_id = previous_selected
             return
+        self._cancel_listing()
+        self._vdelog_choice = None
         self.s3_client = None
         self.current_bucket = ''
         self.current_prefix = ''
@@ -1511,7 +1523,7 @@ class S3BrowserTool:
                 self.status_var.set(
                     f'自动刷新中... '
                     f'({datetime.now().strftime("%H:%M:%S")})')
-                self.refresh_current_path()
+                self.refresh_current_path(prompt_vdelog=False)
             self.auto_refresh_id = self.root.after(
                 interval * 1000, refresh_task)
 
@@ -1519,6 +1531,7 @@ class S3BrowserTool:
 
     def on_closing(self):
         """处理窗口关闭事件，取消未完成的自动刷新定时器"""
+        self._cancel_listing()
         if hasattr(self, 'auto_refresh_id'):
             self.root.after_cancel(self.auto_refresh_id)
         self.root.destroy()
@@ -1765,28 +1778,118 @@ class S3BrowserTool:
         except Exception as e:
             messagebox.showerror('错误', f'获取桶列表时发生意外错误: {str(e)}')
 
-    def list_objects_threaded(self, bucket, prefix):
+    def list_objects_threaded(self, bucket, prefix, *, prompt_vdelog=True):
         """在后台线程中列出 S3 对象，支持增量加载：每批 API 结果到达即刷新 UI。"""
-
+        if not self.s3_client:
+            return
+        cfg = self.get_current_config()
+        choice = None
+        if is_vdelog_path((cfg or {}).get('provider'), bucket, prefix):
+            if self._vdelog_dialog_open:
+                return
+            if prompt_vdelog:
+                self._vdelog_dialog_open = True
+                try:
+                    choice = VdeLogRefreshDialog(self.root, self._vdelog_choice).show()
+                finally:
+                    self._vdelog_dialog_open = False
+            else:
+                choice = self._vdelog_choice
+            if choice is None:
+                # Navigation callers have already updated the path. Do not leave
+                # parent-folder rows displayed as though they belong to vdelog.
+                if self._listing_context != (self.s3_client, bucket, prefix):
+                    self._cancel_listing()
+                    self.full_data = []
+                    self.search_results = []
+                    self.total_objects = 0
+                    self._update_display([], 0, 1)
+                    self.status_var.set('车辆日志尚未刷新，点击“刷新”选择全部车辆或指定 VIN。')
+                return
+            self._vdelog_choice = choice
+        self._cancel_listing()
+        generation = self._listing_generation
+        cancel = threading.Event()
+        self._listing_cancel = cancel
+        self._listing_context = (self.s3_client, bucket, prefix)
+        self._listing_vin = choice[1] if choice and choice[0] == 'vin' else None
         self.loading = True
         self.cancel_loading = False
         self.full_data = []
+        self.search_results = []
+        self.search_var.set('')
         self._loading_batch_count = 0
         self.tree.delete(*self.tree.get_children())
         self.current_page = 0
         self.total_pages = 0
         self.progress.start()
-        self.status_var.set('正在加载... 第 1 批')
+        self.status_var.set(
+            f'正在刷新 VIN {self._listing_vin} 的日志文件夹…'
+            if self._listing_vin else '正在加载列表... 第 1 批')
         self.prev_btn.config(state=tk.DISABLED)
         self.next_btn.config(state=tk.DISABLED)
         self.page_info.config(text='第 0 页 / 共 0 页')
         self.jump_page_var.set('')
 
-        thread = threading.Thread(
-            target=lambda: self._s3_list_objects_incremental(bucket, prefix),
-            daemon=True,
-        )
-        thread.start()
+        events = queue.Queue(maxsize=16)
+        # Snapshot the client and request parameters. A new navigation cancels
+        # this request; its queued or in-flight results cannot affect the new view.
+        threading.Thread(
+            target=self._listing_worker,
+            args=(self.s3_client, bucket, prefix, self._listing_vin, cancel, events),
+            daemon=True).start()
+        self.root.after(50, lambda: self._poll_listing_events(generation, events))
+
+    def _cancel_listing(self):
+        self._listing_generation += 1
+        if self._listing_cancel is not None:
+            self._listing_cancel.set()
+        self.cancel_loading = True
+        self.loading = False
+        self.progress.stop()
+
+    @staticmethod
+    def _emit_listing_event(events, cancel, event):
+        while not cancel.is_set():
+            try:
+                events.put(event, timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+    def _listing_worker(self, client, bucket, prefix, vin, cancel, events):
+        emit = lambda event: self._emit_listing_event(events, cancel, event)
+        try:
+            if vin:
+                if cancel.is_set():
+                    return
+                folders = find_vin_folder(client, bucket, prefix, vin)
+                if folders:
+                    emit(('batch', folders))
+            else:
+                self._s3_list_objects_incremental(bucket, prefix, client, cancel, emit)
+            emit(('done', None))
+        except Exception as exc:
+            emit(('error', str(exc)))
+
+    def _poll_listing_events(self, generation, events):
+        if generation != self._listing_generation:
+            return
+        # All Tk updates happen here on the main thread.
+        for _ in range(8):
+            try:
+                kind, value = events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == 'batch':
+                self._append_batch(value)
+            elif kind == 'done':
+                self._on_incremental_done()
+                return
+            elif kind == 'error':
+                self._on_list_error(value)
+                return
+        self.root.after(50, lambda: self._poll_listing_events(generation, events))
 
     def _on_list_complete(self, objects):
         """列表加载完成回调（主线程执行）"""
@@ -1804,6 +1907,8 @@ class S3BrowserTool:
         self.cancel_loading = False
         self.progress.stop()
         self.full_data = []
+        self.total_objects = 0
+        self._update_display([], 0, 1)
         self.status_var.set(f'加载失败: {error_msg}')
         messagebox.showerror('错误', f'加载对象列表失败: {error_msg}')
 
@@ -1884,79 +1989,74 @@ class S3BrowserTool:
 
         return objects
 
-    def _s3_list_objects_incremental(self, bucket, prefix):
+    def _s3_list_objects_incremental(self, bucket, prefix, client, cancel, emit):
         """后台线程中分页拉取 S3 对象，每批结果通过回调增量追加到 UI。
 
         与 _s3_list_objects 拉取逻辑一致，区别在于：
-        - 每拉取完一页 API 数据（最多 1000 条），立刻通过 after(0) 回调
-          将当前批次追加到 full_data 和 Treeview。
-        - 全部拉取完毕后通过 after(0) 调用 _on_incremental_done 收尾。
+        - 每拉取完一页 API 数据（最多 1000 条），将当前批次放入消息队列，
+          由主线程更新 full_data 和 Treeview。
+        - 使用独立取消信号，旧请求不会污染新的列表。
         """
         continuation_token = None
+        seen_tokens = set()
         prefix = prefix or ''
 
-        try:
-            while True:
-                if self.cancel_loading:
-                    break
+        while not cancel.is_set():
+            params = {
+                'Bucket': bucket,
+                'Prefix': prefix,
+                'Delimiter': '/',
+                'MaxKeys': self.MAX_KEYS,
+            }
+            if continuation_token:
+                params['ContinuationToken'] = continuation_token
 
-                params = {
-                    'Bucket': bucket,
-                    'Prefix': prefix,
-                    'Delimiter': '/',
-                    'MaxKeys': self.MAX_KEYS,
-                }
-                if continuation_token:
-                    params['ContinuationToken'] = continuation_token
+            response = client.list_objects_v2(**params)
+            if cancel.is_set():
+                return
+            batch = []
 
-                response = self.s3_client.list_objects_v2(**params)
-                batch = []
+            # 处理子文件夹（CommonPrefixes）
+            for common_prefix in response.get('CommonPrefixes', []):
+                folder_name = common_prefix['Prefix'][len(prefix):].rstrip('/')
+                if folder_name:
+                    batch.append({
+                        'name': folder_name,
+                        'type': '文件夹',
+                        'size': '-',
+                        'modified': '-',
+                        'key': common_prefix['Prefix'],
+                        'storage_class': '-',
+                        'etag': '-',
+                    })
 
-                # 处理子文件夹（CommonPrefixes）
-                if 'CommonPrefixes' in response:
-                    for common_prefix in response['CommonPrefixes']:
-                        folder_name = common_prefix['Prefix'][len(prefix):].rstrip('/')
-                        if folder_name:
-                            batch.append({
-                                'name': folder_name,
-                                'type': '文件夹',
-                                'size': '-',
-                                'modified': '-',
-                                'key': common_prefix['Prefix'],
-                                'storage_class': '-',
-                                'etag': '-',
-                            })
+            # 处理文件对象（Contents）
+            for obj in response.get('Contents', []):
+                if obj['Key'] == prefix:
+                    continue
+                file_name = obj['Key'][len(prefix):]
+                if '/' in file_name:
+                    continue
+                batch.append({
+                    'name': file_name,
+                    'type': self.get_file_type(file_name),
+                    'size': self.format_size(obj['Size']),
+                    'modified': obj['LastModified'].astimezone(
+                            timezone(timedelta(hours=8))),
+                    'key': obj['Key'],
+                    'storage_class': obj.get('StorageClass', 'STANDARD'),
+                    'etag': obj.get('ETag', '').strip('"'),
+                })
 
-                # 处理文件对象（Contents）
-                if 'Contents' in response:
-                    for obj in response['Contents']:
-                        if obj['Key'] == prefix:
-                            continue
-                        file_name = obj['Key'][len(prefix):]
-                        if '/' in file_name:
-                            continue
-                        batch.append({
-                            'name': file_name,
-                            'type': self.get_file_type(file_name),
-                            'size': self.format_size(obj['Size']),
-                            'modified': obj['LastModified'].astimezone(
-                                    timezone(timedelta(hours=8))),
-                            'key': obj['Key'],
-                            'storage_class': obj.get('StorageClass', 'STANDARD'),
-                            'etag': obj.get('ETag', '').strip('"'),
-                        })
+            if batch:
+                emit(('batch', batch))
 
-                if batch:
-                    # 通过默认参数捕获当前 batch，避免闭包延迟绑定问题
-                    self.root.after(0, lambda b=batch: self._append_batch(b))
-
-                if not response.get('IsTruncated'):
-                    break
-                continuation_token = response.get('NextContinuationToken')
-
-            self.root.after(0, self._on_incremental_done)
-        except Exception as e:
-            self.root.after(0, lambda err=str(e): self._on_list_error(err))
+            if not response.get('IsTruncated'):
+                break
+            continuation_token = response.get('NextContinuationToken')
+            if not continuation_token or continuation_token in seen_tokens:
+                raise ValueError('服务端分页标记缺失或重复，请重新刷新。')
+            seen_tokens.add(continuation_token)
 
     def _append_batch(self, batch_data):
         """将一批 S3 数据增量追加到 full_data 和 Treeview（主线程执行）。
@@ -2006,7 +2106,12 @@ class S3BrowserTool:
 
         # 用最终完整数据重新渲染第一页，确保显示准确
         self._update_display(self.full_data, 0, total_pages)
-        self.status_var.set(f'就绪 | 共 {len(self.full_data)} 个对象')
+        if self._listing_vin:
+            self.status_var.set(
+                f'VIN {self._listing_vin} | 已显示车辆日志文件夹'
+                if self.full_data else f'未找到 VIN {self._listing_vin} 的日志文件夹（路径区分大小写）')
+        else:
+            self.status_var.set(f'就绪 | 共 {len(self.full_data)} 个对象')
 
     # ═══════════════════════════════════════════════════════════
     # ── 显示更新 ──
@@ -2075,11 +2180,13 @@ class S3BrowserTool:
             self.path_var.set(self.build_obs_path())
             self.list_objects_threaded(self.current_bucket, new_prefix)
 
-    def refresh_current_path(self):
+    def refresh_current_path(self, *, prompt_vdelog=True):
         """刷新当前路径下的对象列表"""
-        if self.current_bucket and not self.loading:
+        cfg = self.get_current_config()
+        scoped = is_vdelog_path((cfg or {}).get('provider'), self.current_bucket, self.current_prefix)
+        if self.current_bucket and (not self.loading or scoped):
             self.list_objects_threaded(
-                self.current_bucket, self.current_prefix)
+                self.current_bucket, self.current_prefix, prompt_vdelog=prompt_vdelog)
 
     def clear_cache(self):
         """清除内存中的对象和元数据缓存，然后刷新当前路径"""
