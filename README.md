@@ -33,8 +33,8 @@ flowchart LR
 在 PowerShell 中执行：
 
 ```powershell
-git clone https://github.com/liwanspecial/oss-browser.git
-cd oss-browser
+git clone https://github.com/liwanspecial/oss-browser-public.git
+cd oss-browser-public
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe lxp-test.py
