@@ -1,5 +1,7 @@
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
@@ -15,6 +17,31 @@ from vdelog_browser import (
 )
 
 VIN = 'TEST0000000000001'
+
+
+@pytest.mark.parametrize('configured,expected', [
+    (None, 'example-vehicle-logs'),
+    ('', 'example-vehicle-logs'),
+    ('   ', 'example-vehicle-logs'),
+    ('  custom-vehicle-logs  ', 'custom-vehicle-logs'),
+])
+def test_vehicle_log_bucket_can_be_configured_without_editing_source(configured, expected):
+    # Each launch reads its own configuration without changing Tcl's process environment.
+    environment = os.environ.copy()
+    if configured is None:
+        environment.pop('OSS_BROWSER_VEHICLE_LOG_BUCKET', None)
+    else:
+        environment['OSS_BROWSER_VEHICLE_LOG_BUCKET'] = configured
+    result = subprocess.run(
+        [sys.executable, '-c', 'from vdelog_browser import VDELOG_BUCKET; print(VDELOG_BUCKET)'],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == expected
 
 
 @pytest.mark.parametrize('value', [VIN, VIN.lower(), '  ' + VIN + '  '])

@@ -1,11 +1,15 @@
 """Huawei vehicle-log directory selection and an exact VIN folder lookup."""
 
+import os
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 
-VDELOG_BUCKET = 'example-vehicle-logs'
+VDELOG_BUCKET = (
+    os.environ.get('OSS_BROWSER_VEHICLE_LOG_BUCKET', '').strip()
+    or 'example-vehicle-logs'
+)
 VDELOG_PREFIX = 'data/vdelog/'
 
 
