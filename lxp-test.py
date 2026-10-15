@@ -6,7 +6,8 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+from botocore.regions import EndpointResolverBuiltins
 from datetime import datetime, timezone, timedelta
 import os
 import threading
@@ -24,6 +25,7 @@ import sys
 import shutil
 import uuid
 import queue
+from xml.etree import ElementTree
 
 from vdelog_browser import VdeLogRefreshDialog, is_vdelog_path, find_vin_folder
 
@@ -126,6 +128,28 @@ def safe_join_download_path(base_path, relative_path):
 # ── 华为云 OBS 配置 ──
 # ═══════════════════════════════════════════════════════════
 
+def _parse_obs_bucket_location(http_response, parsed, **_kwargs):
+    """Map Huawei's Location XML element to the S3 response field."""
+    if http_response.status_code != 200 or parsed.get('LocationConstraint'):
+        return
+    try:
+        root = ElementTree.fromstring(http_response.content)
+    except ElementTree.ParseError:
+        return
+    for element in root.iter():
+        if element.tag.rsplit('}', 1)[-1] in ('Location', 'LocationConstraint'):
+            value = (element.text or '').strip()
+            if value:
+                parsed['LocationConstraint'] = value
+                return
+
+
+def _use_obs_location_virtual_host(builtins, model, **_kwargs):
+    """OBS requires bucket hostnames, even for the S3 location operation."""
+    if model.name == 'GetBucketLocation':
+        builtins[EndpointResolverBuiltins.AWS_S3_FORCE_PATH_STYLE] = False
+
+
 def create_s3_client(profile):
     """Create a hardened S3-compatible client from a validated profile."""
     profile = validate_profile(profile)
@@ -145,11 +169,45 @@ def create_s3_client(profile):
     }
     if CA_BUNDLE_PATH:
         kwargs['verify'] = CA_BUNDLE_PATH
-    return boto3.client(**kwargs)
+    client = boto3.client(**kwargs)
+    if profile['provider'] == '华为云OBS':
+        client.meta.events.register_last(
+            'before-endpoint-resolution.s3', _use_obs_location_virtual_host)
+        client.meta.events.register(
+            'after-call.s3.GetBucketLocation', _parse_obs_bucket_location)
+    return client
+
+
+def resolve_obs_bucket_profile(client, profile):
+    """Discover a public OBS bucket's actual region using a read-only query."""
+    if (
+        profile['provider'] != '华为云OBS'
+        or profile['endpoint_url'] != default_endpoint_for(
+            profile['provider'], profile['region_name'])
+    ):
+        return profile
+
+    try:
+        response = client.get_bucket_location(Bucket=profile['bucket_name'])
+    except ClientError as exc:
+        if exc.response.get('Error', {}).get('Code') in (
+            'AccessDenied', 'NotImplemented', 'MethodNotAllowed', '403', '405', '501'
+        ):
+            # A restricted account may still list objects at its configured endpoint.
+            return profile
+        raise
+
+    region = str(response.get('LocationConstraint') or '').strip()
+    if len(region) > 63 or not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)+', region):
+        raise ProfileStoreError('OBS 未返回有效的桶区域，请在桶基本信息中确认区域。')
+    corrected = dict(profile)
+    corrected['region_name'] = region
+    corrected['endpoint_url'] = default_endpoint_for(profile['provider'], region)
+    return validate_profile(corrected)
 
 
 def create_verified_s3_client(profile):
-    """Create a client, following one trusted bucket endpoint redirect."""
+    """Verify the saved endpoint first; discover a region only on routing errors."""
     profile = validate_profile(profile)
     client = create_s3_client(profile)
     request = {'Bucket': profile['bucket_name'], 'MaxKeys': 1}
@@ -158,20 +216,33 @@ def create_verified_s3_client(profile):
         return client, profile
     except ClientError as exc:
         endpoint_url = endpoint_url_from_error_response(exc.response)
-        if (
-            not endpoint_url
-            or endpoint_url == profile['endpoint_url']
-            or not endpoint_matches_provider(profile['provider'], endpoint_url)
+        if endpoint_url and endpoint_url != profile['endpoint_url']:
+            if not endpoint_matches_provider(profile['provider'], endpoint_url):
+                raise
+            region = region_from_endpoint(profile['provider'], endpoint_url)
+            if not region:
+                raise
+            corrected_profile = dict(profile)
+            corrected_profile['endpoint_url'] = endpoint_url
+            corrected_profile['region_name'] = region
+            corrected_profile = validate_profile(corrected_profile)
+        elif (
+            profile['provider'] == '华为云OBS'
+            and exc.response.get('Error', {}).get('Code') in (
+                'NoSuchBucket', 'PermanentRedirect', 'TemporaryRedirect',
+                'IncorrectEndpoint', 'AuthorizationHeaderMalformed',
+                'IllegalLocationConstraintException', '301', '307', '404',
+            )
         ):
+            try:
+                corrected_profile = resolve_obs_bucket_profile(client, profile)
+            except (ClientError, BotoCoreError, ProfileStoreError):
+                # A best-effort query must not replace the actual connection error.
+                raise exc
+            if corrected_profile == profile:
+                raise
+        else:
             raise
-
-        region = region_from_endpoint(profile['provider'], endpoint_url)
-        if not region:
-            raise
-        corrected_profile = dict(profile)
-        corrected_profile['endpoint_url'] = endpoint_url
-        corrected_profile['region_name'] = region
-        corrected_profile = validate_profile(corrected_profile)
         corrected_client = create_s3_client(corrected_profile)
         corrected_client.list_objects_v2(**request)
         return corrected_client, corrected_profile
@@ -201,7 +272,8 @@ class ProfileDialog:
             value=self.initial_profile.get('secret_access_key', ''))
         self.region_var = tk.StringVar(value=region)
         self.endpoint_var = tk.StringVar(
-            value=self.initial_profile.get('endpoint_url', ''))
+            value=self.initial_profile.get('endpoint_url')
+            or default_endpoint_for(provider, region))
         self.bucket_var = tk.StringVar(
             value=self.initial_profile.get('bucket_name', ''))
         self.show_secret_var = tk.BooleanVar(value=False)
@@ -258,8 +330,15 @@ class ProfileDialog:
             command=self._toggle_secret,
         ).grid(row=7, column=1, sticky=tk.W, pady=(0, 8))
 
+        ttk.Label(
+            form,
+            text='Endpoint 留空会自动填写；华为 OBS 测试连接时会尝试识别桶区域。',
+            foreground='#555555',
+            wraplength=360,
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+
         button_row = ttk.Frame(form)
-        button_row.grid(row=8, column=0, columnspan=2, sticky=tk.E)
+        button_row.grid(row=9, column=0, columnspan=2, sticky=tk.E)
         ttk.Button(button_row, text='测试连接', command=self._test).pack(
             side=tk.LEFT, padx=3)
         ttk.Button(button_row, text='保存', command=self._save).pack(
@@ -298,7 +377,7 @@ class ProfileDialog:
         self._last_suggested_endpoint = suggested
 
     def _collect_profile(self):
-        return validate_profile({
+        profile = validate_profile({
             'id': self.profile_id,
             'name': self.name_var.get(),
             'provider': self.provider_var.get(),
@@ -310,6 +389,9 @@ class ProfileDialog:
             'addressing_style': self.initial_profile.get(
                 'addressing_style', 'virtual'),
         })
+        self.region_var.set(profile['region_name'])
+        self.endpoint_var.set(profile['endpoint_url'])
+        return profile
 
     def _test(self):
         try:
@@ -459,13 +541,19 @@ class StartupLoginDialog:
         ).grid(row=11, column=1, sticky=tk.W)
         ttk.Label(
             content,
+            text='Endpoint 留空会自动填写；华为 OBS 登录时会尝试识别桶区域。',
+            foreground='#555555',
+            wraplength=420,
+        ).grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ttk.Label(
+            content,
             textvariable=self.status_var,
             foreground='#555555',
             wraplength=420,
-        ).grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=(8, 12))
+        ).grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=(8, 12))
 
         button_row = ttk.Frame(content)
-        button_row.grid(row=13, column=0, columnspan=2, sticky=tk.E)
+        button_row.grid(row=14, column=0, columnspan=2, sticky=tk.E)
         ttk.Button(
             button_row, text='登录并保存', command=self._login).pack(
                 side=tk.LEFT, padx=3)
@@ -572,6 +660,8 @@ class StartupLoginDialog:
             if (existing['id'] != profile['id']
                     and existing['name'].casefold() == profile['name'].casefold()):
                 raise ProfileStoreError('配置名称不能重复')
+        self.region_var.set(profile['region_name'])
+        self.endpoint_var.set(profile['endpoint_url'])
         return profile
 
     def _login(self):

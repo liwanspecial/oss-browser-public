@@ -183,6 +183,19 @@ def validate_profile(profile: dict) -> dict:
         normalized["addressing_style"] or "virtual"
     )
 
+    if normalized["provider"] == "华为云OBS" and not normalized["region_name"]:
+        if normalized["endpoint_url"]:
+            normalized["region_name"] = region_from_endpoint(
+                normalized["provider"], normalized["endpoint_url"]
+            )
+        else:
+            # Bootstrap address only; the connection step queries the bucket region.
+            normalized["region_name"] = REGIONS_BY_PROVIDER["华为云OBS"][0]
+    if not normalized["endpoint_url"]:
+        normalized["endpoint_url"] = default_endpoint_for(
+            normalized["provider"], normalized["region_name"]
+        )
+
     labels = {
         "id": "配置 ID",
         "name": "配置名称",
@@ -201,7 +214,7 @@ def validate_profile(profile: dict) -> dict:
         raise ProfileStoreError("不支持的服务提供商")
     if normalized["addressing_style"] not in ("virtual", "path"):
         raise ProfileStoreError("寻址方式必须是 virtual 或 path")
-    if normalized["provider"] == "阿里云OSS":
+    if normalized["provider"] in ("阿里云OSS", "华为云OBS"):
         normalized["addressing_style"] = "virtual"
 
     endpoint = normalized["endpoint_url"].rstrip("/")
